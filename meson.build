@@ -247,7 +247,7 @@ executable(
 )
 
 executable(
-    'mpsd_sanketh',
+    'mpsd_append_read',
     files('examples/multipath/mp_one_drive_append_read.cc'),
     dependencies: [zstore_deps] + [dependency('_spdk')],
     link_args: spdk_link_args,
