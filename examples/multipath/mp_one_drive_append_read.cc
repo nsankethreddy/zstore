@@ -8,17 +8,15 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <fmt/core.h>
 #include <cstring>
+#include <fmt/core.h>
 #include <stdio.h>
 #include <vector>
 
 using chrono_tp = std::chrono::high_resolution_clock::time_point;
-// NOTE that here the nqn is zstore2. This is unique per node. We are talking
-// to 12.12.12.2
 static const char *g_hostnqn = "nqn.2024-04.io.zstore3:cnode1";
-
 bool starting_lba = false;
+bool check = false;
 
 struct ctrlr_entry {
     struct spdk_nvme_ctrlr *ctrlr;
@@ -32,7 +30,6 @@ struct ns_entry {
         struct spdk_nvme_ctrlr *ctrlr;
         struct spdk_nvme_ns *ns;
     } nvme;
-
     TAILQ_ENTRY(ns_entry) link;
     uint32_t io_size_blocks;
     uint64_t size_in_ios;
@@ -47,19 +44,11 @@ struct ns_worker_ctx {
     bool is_draining;
     struct spdk_nvme_qpair *qpair;
     TAILQ_ENTRY(ns_worker_ctx) link;
-
     uint64_t count;
-
-    // latency tracking
-    // chrono_tp stime;
-    // chrono_tp etime;
-    // std::vector<chrono_tp> stimes;
-    // std::vector<chrono_tp> etimes;
 };
 
 struct arb_task {
     struct ns_worker_ctx *ns_ctx;
-    // void *buf;
     char *buf;
 };
 
@@ -103,10 +92,8 @@ static TAILQ_HEAD(,
                   ns_entry) g_namespaces = TAILQ_HEAD_INITIALIZER(g_namespaces);
 static TAILQ_HEAD(,
                   worker_thread) g_workers = TAILQ_HEAD_INITIALIZER(g_workers);
-
 static struct feature features[SPDK_NVME_FEAT_ARBITRATION + 1] = {};
 static struct spdk_nvme_transport_id g_trid = {};
-
 static struct arb_context g_arbitration = {
     .shm_id = -1,
     .outstanding_commands = 0,
@@ -121,31 +108,21 @@ static struct arb_context g_arbitration = {
     .io_size_bytes = 4096,
     .time_in_sec = 1,
     .max_completions = 0,
-    /* Default 4 cores for urgent/high/medium/low */
-    // .core_mask = "0xf",
     .core_mask = "0x1",
     .workload_type = "randrw",
 };
 
 static int g_dpdk_mem = 0;
 static bool g_dpdk_mem_single_seg = false;
-
-/*
- * For weighted round robin arbitration mechanism, the smaller value between
- * weight and burst will be picked to execute the commands in one queue.
- */
 #define USER_SPECIFIED_HIGH_PRIORITY_WEIGHT 32
 #define USER_SPECIFIED_MEDIUM_PRIORITY_WEIGHT 16
 #define USER_SPECIFIED_LOW_PRIORITY_WEIGHT 8
 
 static void task_complete(struct arb_task *task);
-
 static void io_complete(void *ctx, const struct spdk_nvme_cpl *completion);
-
+static void io_read_complete(void *ctx, const struct spdk_nvme_cpl *completion);
 static void get_arb_feature(struct spdk_nvme_ctrlr *ctrlr);
-
 static int set_arb_feature(struct spdk_nvme_ctrlr *ctrlr);
-
 static const char *print_qprio(enum spdk_nvme_qprio);
 
 static void register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
@@ -279,50 +256,51 @@ static void register_ctrlr(struct spdk_nvme_ctrlr *ctrlr)
 
 static __thread unsigned int seed = 0;
 
-// static void submit_single_io(struct ns_worker_ctx *ns_ctx)
-// {
-//     struct arb_task *task = NULL;
-//     uint64_t offset_in_ios;
-//     int rc;
-//     struct ns_entry *entry = ns_ctx->entry;
+static void submit_single_read_io(struct ns_worker_ctx *ns_ctx)
+{
+    struct arb_task *task = (struct arb_task *)spdk_mempool_get(task_pool);
+    if (!task) {
+        fprintf(stderr, "Failed to get task from task_pool\n");
+        exit(1);
+    }
 
-//     task = (struct arb_task *)spdk_mempool_get(task_pool);
-//     if (!task) {
-//         fprintf(stderr, "Failed to get task from task_pool\n");
-//         exit(1);
-//     }
+    task->buf = (char *)spdk_zmalloc(g_arbitration.io_size_bytes, 4096, NULL,
+                                     SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+    if (!task->buf) {
+        spdk_mempool_put(task_pool, task);
+        fprintf(stderr, "task->buf spdk_dma_zmalloc failed\n");
+        exit(1);
+    }
 
-//     task->buf =
-//         (char *)spdk_dma_zmalloc(g_arbitration.io_size_bytes, 4096, NULL);
+    task->ns_ctx = ns_ctx;
+    struct ns_entry *entry = ns_ctx->entry;
+    uint64_t offset_in_ios = g_arbitration.is_random
+                                 ? rand_r(&seed) % entry->size_in_ios
+                                 : ns_ctx->offset_in_ios++;
+    if (ns_ctx->offset_in_ios == entry->size_in_ios)
+        ns_ctx->offset_in_ios = 0;
 
-//     // Modified buffer initialization
-//     memcpy(task->buf, "hi from sanketh", strlen("hi from sanketh"));
-//     task->buf[strlen("hi from sanketh")] = '\0'; // Explicit null termination
+    const uint64_t zone_dist = 0x80000;
+    const int current_zone = 0;
+    auto zslba = zone_dist * current_zone;
 
-//     ns_ctx->count++;
+    if (!check) {
+        printf("starting lba 15204352, zslba +count is %d \n",
+               zslba + ns_ctx->count);
+        check = true;
+    }
 
-//     if (!task->buf) {
-//         spdk_mempool_put(task_pool, task);
-//         fprintf(stderr, "task->buf spdk_dma_zmalloc failed\n");
-//         exit(1);
-//     }
+    int rc = spdk_nvme_ns_cmd_read(entry->nvme.ns, ns_ctx->qpair, task->buf,
+                                   zslba + ns_ctx->count, entry->io_size_blocks,
+                                   io_read_complete, task, 0);
+    ns_ctx->count++;
 
-//     task->ns_ctx = ns_ctx;
-
-//     const uint64_t zone_dist = 0x80000; // zone size
-//     const int current_zone = 0;
-//     auto zslba = zone_dist * current_zone;
-
-//     rc = spdk_nvme_zns_zone_append(entry->nvme.ns, ns_ctx->qpair, task->buf,
-//                                    zslba, entry->io_size_blocks, io_complete,
-//                                    task, 0);
-
-//     if (rc != 0) {
-//         fprintf(stderr, "starting I/O failed\n");
-//     } else {
-//         ns_ctx->current_queue_depth++;
-//     }
-// }
+    if (rc != 0) {
+        fprintf(stderr, "starting I/O failed\n");
+    } else {
+        ns_ctx->current_queue_depth++;
+    }
+}
 
 static void submit_single_io(struct ns_worker_ctx *ns_ctx)
 {
@@ -369,35 +347,14 @@ static void submit_single_io(struct ns_worker_ctx *ns_ctx)
     }
 }
 
-
 static void task_complete(struct arb_task *task)
 {
     struct ns_worker_ctx *ns_ctx;
-
     ns_ctx = task->ns_ctx;
     ns_ctx->current_queue_depth--;
     ns_ctx->io_completed++;
-    // ns_ctx->etime = std::chrono::high_resolution_clock::now();
-    // ns_ctx->etimes.push_back(ns_ctx->etime);
-
     spdk_dma_free(task->buf);
     spdk_mempool_put(task_pool, task);
-
-    /*
-     * is_draining indicates when time has expired for the test run
-     * and we are just waiting for the previously submitted I/O
-     * to complete.  In this case, do not submit a new I/O to replace
-     * the one just completed.
-     */
-    // 524288
-    // 275712
-    // if (!ns_ctx->is_draining) {
-        // if (275700 < ns_ctx->io_completed)
-        //     printf("io completed: %d\n", ns_ctx->io_completed);
-        // if (ns_ctx->io_completed < 275700)
-        // if (ns_ctx->io_completed < 18500)
-        // submit_single_io(ns_ctx);
-    // }
 }
 
 static void io_complete(void *ctx, const struct spdk_nvme_cpl *completion)
@@ -407,6 +364,11 @@ static void io_complete(void *ctx, const struct spdk_nvme_cpl *completion)
         printf("Starting lba is: %d\n", completion->cdw0);
         starting_lba = true;
     }
+}
+
+static void io_read_complete(void *ctx, const struct spdk_nvme_cpl *completion)
+{
+    task_complete((struct arb_task *)ctx);
 }
 
 static void check_io(struct ns_worker_ctx *ns_ctx)
@@ -419,6 +381,13 @@ static void submit_io(struct ns_worker_ctx *ns_ctx, int queue_depth)
 {
     while (queue_depth-- > 0) {
         submit_single_io(ns_ctx);
+    }
+}
+
+static void submit_read_io(struct ns_worker_ctx *ns_ctx, int queue_depth)
+{
+    while (queue_depth-- > 0) {
+        submit_single_read_io(ns_ctx);
     }
 }
 
@@ -444,11 +413,6 @@ static int init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx,
         printf("ERROR: spdk_nvme_ctrlr_alloc_io_qpair failed\n");
         return 1;
     }
-
-    // allocate space for times
-    // ns_ctx->stimes.reserve(1000000);
-    // ns_ctx->etimes.reserve(1000000);
-
     ns_ctx->count = 0;
     return 0;
 }
@@ -473,8 +437,6 @@ static void cleanup(uint32_t task_count)
     TAILQ_FOREACH_SAFE(worker, &g_workers, link, tmp_worker)
     {
         TAILQ_REMOVE(&g_workers, worker, link);
-
-        /* ns_worker_ctx is a list in the worker */
         TAILQ_FOREACH_SAFE(ns_ctx, &worker->ns_ctx, link, tmp_ns_ctx)
         {
             TAILQ_REMOVE(&worker->ns_ctx, ns_ctx, link);
@@ -499,8 +461,6 @@ static int work_fn(void *arg)
 
     printf("Starting thread on core %u with %s\n", worker->lcore,
            print_qprio(worker->qprio));
-
-    /* Allocate a queue pair for each namespace. */
     TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link)
     {
         if (init_ns_worker_ctx(ns_ctx, worker->qprio) != 0) {
@@ -511,10 +471,6 @@ static int work_fn(void *arg)
 
     tsc_end =
         spdk_get_ticks() + g_arbitration.time_in_sec * g_arbitration.tsc_rate;
-    // printf("tick %s, time in sec %s, tsc rate %s", spdk_get_ticks(),
-    //        g_arbitration.time_in_sec, g_arbitration.tsc_rate);
-
-    /* Submit initial I/O for each namespace. */
     TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link)
     {
         submit_io(ns_ctx, g_arbitration.queue_depth);
@@ -526,13 +482,7 @@ static int work_fn(void *arg)
          * I/O will be submitted in the io_complete callback
          * to replace each I/O that is completed.
          */
-        TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link)
-        {
-            check_io(ns_ctx);
-            // if (ns_ctx->io_completed > 200000) {
-            //     goto exit;
-            // }
-        }
+        TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) { check_io(ns_ctx); }
 
         if (spdk_get_ticks() > tsc_end) {
             break;
@@ -544,26 +494,52 @@ exit:
     {
         drain_io(ns_ctx);
         cleanup_ns_worker_ctx(ns_ctx);
+    }
 
-        // std::vector<uint64_t> deltas1;
-        // for (int i = 0; i < ns_ctx->stimes.size(); i++) {
-        //     deltas1.push_back(
-        //         std::chrono::duration_cast<std::chrono::microseconds>(
-        //             ns_ctx->etimes[i] - ns_ctx->stimes[i])
-        //             .count());
-        // }
-        // auto sum1 = std::accumulate(deltas1.begin(), deltas1.end(), 0.0);
-        // auto mean1 = sum1 / deltas1.size();
-        // auto sq_sum1 = std::inner_product(deltas1.begin(), deltas1.end(),
-        //                                   deltas1.begin(), 0.0);
-        // auto stdev1 = std::sqrt(sq_sum1 / deltas1.size() - mean1 * mean1);
-        // printf("qd: %d, mean %f, std %f\n", ns_ctx->io_completed, mean1,
-        //        stdev1);
-        //
-        // // clearnup
-        // deltas1.clear();
-        // ns_ctx->etimes.clear();
-        // ns_ctx->stimes.clear();
+    return 0;
+}
+
+static int work_fn2(void *arg)
+{
+    uint64_t tsc_end;
+    struct worker_thread *worker = (struct worker_thread *)arg;
+    struct ns_worker_ctx *ns_ctx;
+
+    printf("Starting thread on core %u with %s\n", worker->lcore,
+           print_qprio(worker->qprio));
+    TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link)
+    {
+        if (init_ns_worker_ctx(ns_ctx, worker->qprio) != 0) {
+            printf("ERROR: init_ns_worker_ctx() failed\n");
+            return 1;
+        }
+    }
+
+    tsc_end =
+        spdk_get_ticks() + g_arbitration.time_in_sec * g_arbitration.tsc_rate;
+    TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link)
+    {
+        submit_read_io(ns_ctx, g_arbitration.queue_depth);
+    }
+
+    while (1) {
+        /*
+         * Check for completed I/O for each controller. A new
+         * I/O will be submitted in the io_complete callback
+         * to replace each I/O that is completed.
+         */
+        TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) { check_io(ns_ctx); }
+
+        if (spdk_get_ticks() > tsc_end) {
+            break;
+        }
+    }
+
+exit:
+    TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link)
+    {
+        drain_io(ns_ctx);
+        cleanup_ns_worker_ctx(ns_ctx);
     }
 
     return 0;
@@ -947,7 +923,6 @@ static int register_workers(void)
 static bool probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
                      struct spdk_nvme_ctrlr_opts *opts)
 {
-    /* Update with user specified arbitration configuration */
     opts->arb_mechanism =
         static_cast<enum spdk_nvme_cc_ams>(g_arbitration.arbitration_mechanism);
 
@@ -980,22 +955,13 @@ static void zns_dev_init(struct arb_context *ctx, std::string ip1,
     snprintf(trid1.subnqn, sizeof(trid1.subnqn), "%s", g_hostnqn);
     trid1.adrfam = SPDK_NVMF_ADRFAM_IPV4;
 
-    // Here we specify the transport type
     trid1.trtype = SPDK_NVME_TRANSPORT_RDMA;
-
-    // struct spdk_nvme_transport_id trid2 = {};
-    // snprintf(trid2.traddr, sizeof(trid2.traddr), "%s", ip2.c_str());
-    // snprintf(trid2.trsvcid, sizeof(trid2.trsvcid), "%s", port2.c_str());
-    // snprintf(trid2.subnqn, sizeof(trid2.subnqn), "%s", g_hostnqn);
-    // trid2.adrfam = SPDK_NVMF_ADRFAM_IPV4;
-    // trid2.trtype = SPDK_NVME_TRANSPORT_TCP;
 
     struct spdk_nvme_ctrlr_opts opts;
     spdk_nvme_ctrlr_get_default_ctrlr_opts(&opts, sizeof(opts));
     memcpy(opts.hostnqn, g_hostnqn, sizeof(opts.hostnqn));
 
     register_ctrlr(spdk_nvme_connect(&trid1, &opts, sizeof(opts)));
-    // register_ctrlr(spdk_nvme_connect(&trid2, &opts, sizeof(opts)));
 
     printf("Found %d namspaces\n", g_arbitration.num_namespaces);
 }
@@ -1003,18 +969,7 @@ static void zns_dev_init(struct arb_context *ctx, std::string ip1,
 static int register_controllers(struct arb_context *ctx)
 {
     printf("Initializing NVMe Controllers\n");
-
-    // RDMA
-    // zns_dev_init(ctx, "192.168.100.9", "5520");
-    // TCP
     zns_dev_init(ctx, "12.12.12.3", "5520");
-    // zns_dev_init(ctx, "12.12.12.2", "5520");
-
-    // if (spdk_nvme_probe(&g_trid, NULL, probe_cb, attach_cb, NULL) != 0) {
-    //     fprintf(stderr, "spdk_nvme_probe() failed\n");
-    //     return 1;
-    // }
-
     if (g_arbitration.num_namespaces == 0) {
         fprintf(stderr, "No valid namespaces to continue IO testing\n");
         return 1;
@@ -1217,10 +1172,6 @@ static void zstore_cleanup(uint32_t task_count)
     cleanup(task_count);
 
     spdk_env_fini();
-
-    // if (rc != 0) {
-    //     fprintf(stderr, "%s: errors occurred\n", argv[0]);
-    // }
 }
 
 int main(int argc, char **argv)
@@ -1271,11 +1222,6 @@ int main(int argc, char **argv)
 
     snprintf(task_pool_name, sizeof(task_pool_name), "task_pool_%d", getpid());
 
-    /*
-     * The task_count will be dynamically calculated based on the
-     * number of attached active namespaces, queue depth and number
-     * of cores (workers) involved in the IO perations.
-     */
     task_count = g_arbitration.num_namespaces > g_arbitration.num_workers
                      ? g_arbitration.num_namespaces
                      : g_arbitration.num_workers;
@@ -1295,7 +1241,6 @@ int main(int argc, char **argv)
 
     printf("Initialization complete. Launching workers.\n");
 
-    /* Launch all of the secondary workers */
     main_core = spdk_env_get_current_core();
     main_worker = NULL;
     TAILQ_FOREACH(worker, &g_workers, link)
@@ -1310,6 +1255,7 @@ int main(int argc, char **argv)
 
     assert(main_worker != NULL);
     rc = work_fn(main_worker);
+    rc = work_fn2(main_worker);
 
     spdk_env_thread_wait_all();
 
