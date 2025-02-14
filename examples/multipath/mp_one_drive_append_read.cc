@@ -15,7 +15,7 @@
 
 using chrono_tp = std::chrono::high_resolution_clock::time_point;
 static const char *g_hostnqn = "nqn.2024-04.io.zstore3:cnode1";
-bool starting_lba = false;
+static uint64_t starting_lba = false;
 bool check = false;
 
 struct ctrlr_entry {
@@ -97,17 +97,19 @@ static struct spdk_nvme_transport_id g_trid = {};
 static struct arb_context g_arbitration = {
     .shm_id = -1,
     .outstanding_commands = 0,
-    .num_workers = 0,
     .num_namespaces = 0,
+    .num_workers = 0,
     .rw_percentage = 50,
+    .is_random = 0,
     .queue_depth = 1,
+    .time_in_sec = 1,
     .io_count = 1000000,
     .latency_tracking_enable = 0,
     .arbitration_mechanism = SPDK_NVME_CC_AMS_RR,
     .arbitration_config = 0,
     .io_size_bytes = 4096,
-    .time_in_sec = 1,
     .max_completions = 0,
+    .tsc_rate = 0,
     .core_mask = "0x1",
     .workload_type = "randrw",
 };
@@ -254,8 +256,6 @@ static void register_ctrlr(struct spdk_nvme_ctrlr *ctrlr)
     }
 }
 
-static __thread unsigned int seed = 0;
-
 static void submit_single_read_io(struct ns_worker_ctx *ns_ctx)
 {
     struct arb_task *task = (struct arb_task *)spdk_mempool_get(task_pool);
@@ -274,24 +274,14 @@ static void submit_single_read_io(struct ns_worker_ctx *ns_ctx)
 
     task->ns_ctx = ns_ctx;
     struct ns_entry *entry = ns_ctx->entry;
-    uint64_t offset_in_ios = g_arbitration.is_random
-                                 ? rand_r(&seed) % entry->size_in_ios
-                                 : ns_ctx->offset_in_ios++;
-    if (ns_ctx->offset_in_ios == entry->size_in_ios)
-        ns_ctx->offset_in_ios = 0;
-
-    const uint64_t zone_dist = 0x80000;
-    const int current_zone = 0;
-    auto zslba = zone_dist * current_zone;
 
     if (!check) {
-        printf("starting lba 15204352, zslba +count is %d \n",
-               zslba + ns_ctx->count);
+        printf("[READ] Starting LBA: %lu \n", starting_lba);
         check = true;
     }
 
     int rc = spdk_nvme_ns_cmd_read(entry->nvme.ns, ns_ctx->qpair, task->buf,
-                                   zslba + ns_ctx->count, entry->io_size_blocks,
+                                   starting_lba, entry->io_size_blocks,
                                    io_read_complete, task, 0);
     ns_ctx->count++;
 
@@ -317,10 +307,13 @@ static void submit_single_io(struct ns_worker_ctx *ns_ctx)
     task->buf =
         (char *)spdk_dma_zmalloc(g_arbitration.io_size_bytes, 4096, NULL);
 
-    // Use std:: versions from <bits/stdc++.h>
     const char *message = "hi from sanketh";
-    memcpy(task->buf, message, strlen(message));
-    task->buf[strlen(message)] = '\0';
+    const size_t msg_len = strlen(message);
+
+    memcpy(task->buf, message, msg_len);
+    task->buf[msg_len] = '\0'; // null-terminate the string
+
+    printf("[WRITE] Data: %s\n", (char *)task->buf);
 
     ns_ctx->count++;
 
@@ -359,16 +352,38 @@ static void task_complete(struct arb_task *task)
 
 static void io_complete(void *ctx, const struct spdk_nvme_cpl *completion)
 {
-    task_complete((struct arb_task *)ctx);
-    if (!starting_lba) {
-        printf("Starting lba is: %d\n", completion->cdw0);
-        starting_lba = true;
+    struct arb_task *task = (struct arb_task *)ctx;
+
+    if (spdk_nvme_cpl_is_error(completion)) {
+        printf("[WRITE ERROR] Status: %s\n",
+               spdk_nvme_cpl_get_status_string(&completion->status));
     }
+
+    if (!starting_lba) {
+        starting_lba = completion->cdw0;
+        printf("[WRITE] Starting LBA: 0x%" PRIx64 "\n", starting_lba);
+        printf("[WRITE] Starting LBA: %lu \n", starting_lba);
+    }
+
+    task_complete(task);
 }
 
 static void io_read_complete(void *ctx, const struct spdk_nvme_cpl *completion)
 {
-    task_complete((struct arb_task *)ctx);
+    struct arb_task *task = (struct arb_task *)ctx;
+
+    if (spdk_nvme_cpl_is_error(completion)) {
+        printf("[READ ERROR] Status: %s\n",
+               spdk_nvme_cpl_get_status_string(&completion->status));
+    } else {
+        // Ensure null termination for safe string printing
+        const uint32_t buf_size = g_arbitration.io_size_bytes;
+        task->buf[buf_size - 1] = '\0';
+
+        printf("[READ] Data: %s\n", (char *)task->buf);
+    }
+
+    task_complete(task);
 }
 
 static void check_io(struct ns_worker_ctx *ns_ctx)
@@ -489,13 +504,6 @@ static int work_fn(void *arg)
         }
     }
 
-exit:
-    TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link)
-    {
-        drain_io(ns_ctx);
-        cleanup_ns_worker_ctx(ns_ctx);
-    }
-
     return 0;
 }
 
@@ -533,13 +541,6 @@ static int work_fn2(void *arg)
         if (spdk_get_ticks() > tsc_end) {
             break;
         }
-    }
-
-exit:
-    TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link)
-    {
-        drain_io(ns_ctx);
-        cleanup_ns_worker_ctx(ns_ctx);
     }
 
     return 0;
@@ -628,7 +629,7 @@ static void print_performance(void)
             printf("%-43.43s core %u: %8.2f IO/s %8.2f secs/%d ios\n",
                    ns_ctx->entry->name, worker->lcore, io_per_second,
                    sent_all_io_in_secs, g_arbitration.io_count);
-            printf("Completed IO %d\n", ns_ctx->io_completed);
+            printf("Completed IO %lu\n", ns_ctx->io_completed);
         }
     }
     printf("========================================================\n");
@@ -920,34 +921,9 @@ static int register_workers(void)
     return 0;
 }
 
-static bool probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
-                     struct spdk_nvme_ctrlr_opts *opts)
-{
-    opts->arb_mechanism =
-        static_cast<enum spdk_nvme_cc_ams>(g_arbitration.arbitration_mechanism);
-
-    printf("Attaching to %s\n", trid->traddr);
-
-    return true;
-}
-
-static void attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
-                      struct spdk_nvme_ctrlr *ctrlr,
-                      const struct spdk_nvme_ctrlr_opts *opts)
-{
-    printf("Attached to %s\n", trid->traddr);
-
-    /* Update with actual arbitration configuration in use */
-    g_arbitration.arbitration_mechanism = opts->arb_mechanism;
-
-    register_ctrlr(ctrlr);
-}
-
 static void zns_dev_init(struct arb_context *ctx, std::string ip1,
                          std::string port1)
 {
-    int rc = 0;
-
     // 1. connect nvmf device
     struct spdk_nvme_transport_id trid1 = {};
     snprintf(trid1.traddr, sizeof(trid1.traddr), "%s", ip1.c_str());
@@ -1199,7 +1175,7 @@ int main(int argc, char **argv)
     }
 
     g_arbitration.tsc_rate = spdk_get_ticks_hz();
-    printf("DEBUG %d\n", spdk_get_ticks_hz());
+    printf("DEBUG %lu\n", spdk_get_ticks_hz());
 
     if (register_workers() != 0) {
         rc = 1;
