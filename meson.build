@@ -216,6 +216,17 @@ t6 = executable(
 )
 test('Append and read buffer', t6)
 
+# unit tests
+t6 = executable(
+	'test_4KB_E2E',
+	zstore_src + ['src/tests/unit_tests/4KB_E2E_test.cc'],
+	dependencies: [zstore_deps] + [rdma],
+	include_directories: zk_inc_dir,
+	link_args: spdk_link_args,
+	install: true,
+)
+test('4K end to end test', t6)
+
 # executable(
 # 	'test_map',
 # 	files('src/tests/map_test.cc'),
