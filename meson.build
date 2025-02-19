@@ -210,6 +210,15 @@ t4 = executable(
 )
 test('4KB object', t4)
 
+t3 = executable(
+    'test_4KB_E2E',
+    files('src/tests/4KB_E2E_test.cc'),
+    dependencies: [zstore_deps],
+    link_args: spdk_link_args,
+    install: true,
+)
+test('4KB E2E', t4)
+
 t5 = executable(
     'test_4MB_object',
     files('src/tests/4MB_object_test.cc'),
